@@ -7,10 +7,9 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-app.use(express.json());
+
 
 // Keep a rolling in-memory history of signal points
-const MAX_STORED_SIGNALS = 1000;
 const DEFAULT_DEVICE_ID = 'esp32-001';
 
 const signals = [
@@ -87,24 +86,20 @@ app.get('/signals', (req, res) => {
     );
   }
 
-  let parsedLimit = parseInt(limit, 10);
-  if (Number.isNaN(parsedLimit) || parsedLimit <= 0) {
-    parsedLimit = 20;
-  }
-
-  if (parsedLimit > MAX_STORED_SIGNALS) {
-    parsedLimit = MAX_STORED_SIGNALS;
-  }
-
-  const recentSignals = filteredSignals
+  const sortedSignals = filteredSignals
     .slice()
     .sort(
       (a, b) =>
         new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-    )
-    .slice(-parsedLimit);
+    );
 
-  res.json(recentSignals);
+  const parsedLimit = parseInt(limit, 10);
+
+  if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+    return res.json(sortedSignals.slice(-parsedLimit));
+  }
+
+  return res.json(sortedSignals);
 });
 
 // Receive new signal point OR a batch of signal points from ESP32
@@ -140,10 +135,6 @@ app.post('/signal', (req, res) => {
 
   signals.push(...newSignals);
 
-  // Keep only the newest MAX_STORED_SIGNALS readings
-  if (signals.length > MAX_STORED_SIGNALS) {
-    signals.splice(0, signals.length - MAX_STORED_SIGNALS);
-  }
 
   res.json({
     success: true,
