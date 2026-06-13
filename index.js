@@ -12,11 +12,11 @@ const DEFAULT_DEVICE_ID = 'esp32-001';
 const KNOWN_DEVICES = [
   {
     deviceId: 'esp32-001',
-    label: 'Pump 1',
+    label: 'Hilltop',
   },
   {
     deviceId: 'esp32-002',
-    label: 'Pump 2',
+    label: 'Site 3',
   },
 ];
 
