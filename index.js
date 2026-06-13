@@ -7,19 +7,20 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-
-
-// Keep a rolling in-memory history of signal points
 const DEFAULT_DEVICE_ID = 'esp32-001';
 
-const signals = [
+const KNOWN_DEVICES = [
   {
-    deviceId: DEFAULT_DEVICE_ID,
-    triggered: false,
-    value: 0,
-    timestamp: new Date().toISOString(),
+    deviceId: 'esp32-001',
+    label: 'Pump 1',
+  },
+  {
+    deviceId: 'esp32-002',
+    label: 'Pump 2',
   },
 ];
+
+const signals = [];
 
 function normalizeTimestamp(input) {
   if (typeof input === 'number' && Number.isFinite(input)) {
@@ -62,6 +63,10 @@ app.get('/', (req, res) => {
   res.send('Backend is running 🚀');
 });
 
+app.get('/devices', (req, res) => {
+  res.json(KNOWN_DEVICES);
+});
+
 // Get the latest signal only
 app.get('/signal', (req, res) => {
   const { deviceId } = req.query;
@@ -74,7 +79,7 @@ app.get('/signal', (req, res) => {
   res.json(latestSignal);
 });
 
-// Get recent signal history for charting
+// Get signal history for charting
 app.get('/signals', (req, res) => {
   const { deviceId, limit } = req.query;
 
@@ -134,7 +139,6 @@ app.post('/signal', (req, res) => {
   );
 
   signals.push(...newSignals);
-
 
   res.json({
     success: true,
