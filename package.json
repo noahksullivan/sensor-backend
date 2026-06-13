@@ -18,6 +18,7 @@
   },
   "homepage": "https://github.com/noahksullivan/sensor-backend#readme",
   "dependencies": {
+    "cors": "^2.8.6",
     "express": "^5.2.1"
   }
 }
