@@ -14,6 +14,9 @@ const DEFAULT_HISTORY_BUCKET_COUNT = 800;
 const MAX_HISTORY_BUCKET_COUNT = 1000;
 const DEFAULT_PAGE_SIZE = 200;
 const MAX_PAGE_SIZE = 500;
+const DEFAULT_TRANSITION_LIMIT = 20;
+const MAX_TRANSITION_LIMIT = 100;
+const ON_THRESHOLD_AMPS = 0.5;
 
 const KNOWN_DEVICES = [
   {
@@ -30,12 +33,28 @@ const signalsByDevice = Object.fromEntries(
   KNOWN_DEVICES.map((device) => [device.deviceId, []])
 );
 
+const transitionsByDevice = Object.fromEntries(
+  KNOWN_DEVICES.map((device) => [device.deviceId, []])
+);
+
+const currentStateByDevice = Object.fromEntries(
+  KNOWN_DEVICES.map((device) => [device.deviceId, null])
+);
+
 function ensureSignalStore(deviceId) {
   if (!signalsByDevice[deviceId]) {
     signalsByDevice[deviceId] = [];
   }
 
   return signalsByDevice[deviceId];
+}
+
+function ensureTransitionStore(deviceId) {
+  if (!transitionsByDevice[deviceId]) {
+    transitionsByDevice[deviceId] = [];
+  }
+
+  return transitionsByDevice[deviceId];
 }
 
 function sanitizePositiveInt(value, fallback, max) {
@@ -180,6 +199,74 @@ function bucketSignals(points, bucketCount) {
   return bucketed;
 }
 
+function getPointState(point) {
+  return point.value >= ON_THRESHOLD_AMPS ? 'ON' : 'OFF';
+}
+
+function createStateTracker(point) {
+  return {
+    state: getPointState(point),
+    startedAt: point.timestamp,
+    startedAtMs: point.timestampMs,
+    lastTimestamp: point.timestamp,
+    lastTimestampMs: point.timestampMs,
+  };
+}
+
+function buildCompletedTransition(tracker, endPoint) {
+  return {
+    state: tracker.state,
+    startedAt: tracker.startedAt,
+    endedAt: endPoint.timestamp,
+    durationSeconds: Math.max(
+      0,
+      Math.round((endPoint.timestampMs - tracker.startedAtMs) / 1000)
+    ),
+  };
+}
+
+function processPointForTransitions(deviceId, point) {
+  const transitions = ensureTransitionStore(deviceId);
+  const existingTracker = currentStateByDevice[deviceId];
+  const pointState = getPointState(point);
+
+  if (!existingTracker) {
+    currentStateByDevice[deviceId] = createStateTracker(point);
+    return;
+  }
+
+  if (existingTracker.state === pointState) {
+    existingTracker.lastTimestamp = point.timestamp;
+    existingTracker.lastTimestampMs = point.timestampMs;
+    return;
+  }
+
+  transitions.push(buildCompletedTransition(existingTracker, point));
+  currentStateByDevice[deviceId] = createStateTracker(point);
+}
+
+function recomputeDerivedDataForDevice(deviceId) {
+  const deviceSignals = ensureSignalStore(deviceId);
+  transitionsByDevice[deviceId] = [];
+  currentStateByDevice[deviceId] = null;
+
+  for (const point of deviceSignals) {
+    processPointForTransitions(deviceId, point);
+  }
+}
+
+function getLastCompletedDuration(deviceId, state) {
+  const transitions = ensureTransitionStore(deviceId);
+
+  for (let index = transitions.length - 1; index >= 0; index -= 1) {
+    if (transitions[index].state === state) {
+      return transitions[index].durationSeconds;
+    }
+  }
+
+  return null;
+}
+
 app.get('/', (req, res) => {
   res.send('Backend is running 🚀');
 });
@@ -194,6 +281,50 @@ app.get('/signal', (req, res) => {
   const latestSignal = deviceSignals[deviceSignals.length - 1] || null;
 
   res.json(latestSignal ? toPublicSignalPoint(latestSignal) : null);
+});
+
+app.get('/dashboard', (req, res) => {
+  const { deviceId } = req.query;
+
+  if (!deviceId) {
+    return res.status(400).json({
+      success: false,
+      message: 'deviceId is required.',
+    });
+  }
+
+  const transitionLimit = sanitizePositiveInt(
+    req.query.transitionLimit,
+    DEFAULT_TRANSITION_LIMIT,
+    MAX_TRANSITION_LIMIT
+  );
+
+  const deviceSignals = getDeviceSignals(deviceId);
+  const latestSignal = deviceSignals[deviceSignals.length - 1] || null;
+  const currentTracker = currentStateByDevice[deviceId];
+  const recentTransitions = ensureTransitionStore(deviceId)
+    .slice(-transitionLimit)
+    .reverse();
+
+  const currentStateDurationSeconds =
+    latestSignal && currentTracker
+      ? Math.max(
+          0,
+          Math.round((latestSignal.timestampMs - currentTracker.startedAtMs) / 1000)
+        )
+      : 0;
+
+  res.json({
+    deviceId,
+    thresholdAmps: ON_THRESHOLD_AMPS,
+    latestSignal: latestSignal ? toPublicSignalPoint(latestSignal) : null,
+    currentState: currentTracker?.state ?? null,
+    currentStateStartedAt: currentTracker?.startedAt ?? null,
+    currentStateDurationSeconds,
+    lastCompletedOnDurationSeconds: getLastCompletedDuration(deviceId, 'ON'),
+    lastCompletedOffDurationSeconds: getLastCompletedDuration(deviceId, 'OFF'),
+    recentTransitions,
+  });
 });
 
 app.get('/signals/summary', (req, res) => {
@@ -323,15 +454,18 @@ app.post('/signal', (req, res) => {
 
   const deviceSignals = ensureSignalStore(requestDeviceId);
   const lastExistingPoint = deviceSignals[deviceSignals.length - 1];
+  const isOutOfOrder =
+    lastExistingPoint && lastExistingPoint.timestampMs > newSignals[0].timestampMs;
 
-  if (
-    !lastExistingPoint ||
-    lastExistingPoint.timestampMs <= newSignals[0].timestampMs
-  ) {
-    deviceSignals.push(...newSignals);
-  } else {
-    deviceSignals.push(...newSignals);
+  deviceSignals.push(...newSignals);
+
+  if (isOutOfOrder) {
     deviceSignals.sort((a, b) => a.timestampMs - b.timestampMs);
+    recomputeDerivedDataForDevice(requestDeviceId);
+  } else {
+    newSignals.forEach((point) => {
+      processPointForTransitions(requestDeviceId, point);
+    });
   }
 
   res.json({
