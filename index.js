@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -32,6 +33,14 @@ const KNOWN_DEVICES = [
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const discordWebhookUrl = (
+  process.env.DISCORD_ALERT_WEBHOOK_URL || ''
+).trim();
+
+const discordAlertTestToken = (
+  process.env.DISCORD_ALERT_TEST_TOKEN || ''
+).trim();
 
 if (!supabaseUrl || !supabaseKey) {
   throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
@@ -197,12 +206,351 @@ async function getRecentTransitionRows(deviceId, limit) {
   return data ?? [];
 }
 
+function getDeviceLabel(deviceId) {
+  return (
+    KNOWN_DEVICES.find((device) => device.deviceId === deviceId)?.label ??
+    deviceId
+  );
+}
+
+function formatDurationSeconds(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+
+  return `${seconds}s`;
+}
+
+function postDiscordWebhook(payload) {
+  if (!discordWebhookUrl) {
+    return Promise.reject(
+      new Error('DISCORD_ALERT_WEBHOOK_URL is not configured.')
+    );
+  }
+
+  const webhookUrl = new URL(discordWebhookUrl);
+  webhookUrl.searchParams.set('wait', 'true');
+
+  const body = JSON.stringify(payload);
+
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      {
+        protocol: webhookUrl.protocol,
+        hostname: webhookUrl.hostname,
+        port: webhookUrl.port || 443,
+        path: `${webhookUrl.pathname}${webhookUrl.search}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (response) => {
+        let responseBody = '';
+
+        response.setEncoding('utf8');
+
+        response.on('data', (chunk) => {
+          responseBody += chunk;
+        });
+
+        response.on('end', () => {
+          const statusCode = response.statusCode ?? 0;
+
+          if (statusCode >= 200 && statusCode < 300) {
+            let parsedBody = null;
+
+            if (responseBody) {
+              try {
+                parsedBody = JSON.parse(responseBody);
+              } catch (error) {
+                parsedBody = null;
+              }
+            }
+
+            resolve({
+              statusCode,
+              body: parsedBody,
+            });
+
+            return;
+          }
+
+          reject(
+            new Error(
+              `Discord webhook failed with status ${statusCode}: ${responseBody.slice(
+                0,
+                500
+              )}`
+            )
+          );
+        });
+      }
+    );
+
+    request.setTimeout(10000, () => {
+      request.destroy(new Error('Discord webhook request timed out.'));
+    });
+
+    request.on('error', reject);
+    request.write(body);
+    request.end();
+  });
+}
+
+async function updateAlertNotificationStatus(
+  alertRow,
+  status,
+  errorMessage = null
+) {
+  const updateRow = {
+    notification_status: status,
+    notification_attempts:
+      Number(alertRow.notification_attempts ?? 0) + 1,
+    notification_sent_at:
+      status === 'SENT' ? new Date().toISOString() : null,
+    last_notification_error:
+      errorMessage === null
+        ? null
+        : String(errorMessage).slice(0, 1000),
+  };
+
+  const { error } = await supabase
+    .from('device_alerts')
+    .update(updateRow)
+    .eq('id', alertRow.id);
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function sendLongOnDiscordAlert(alertRow) {
+  const deviceLabel = getDeviceLabel(alertRow.device_id);
+
+  return postDiscordWebhook({
+    username: 'Pump Monitor',
+
+    content: `🚨 ${deviceLabel} pump is running abnormally long.`,
+
+    allowed_mentions: {
+      parse: [],
+    },
+
+    embeds: [
+      {
+        title: 'Pump Running Abnormally Long',
+
+        description:
+          'The current ON cycle has exceeded the normal duration by more than three standard deviations.',
+
+        color: 0xdc2626,
+
+        fields: [
+          {
+            name: 'Location',
+            value: deviceLabel,
+            inline: true,
+          },
+          {
+            name: 'Device',
+            value: alertRow.device_id,
+            inline: true,
+          },
+          {
+            name: 'Current ON time',
+            value: formatDurationSeconds(
+              alertRow.current_duration_seconds
+            ),
+            inline: false,
+          },
+          {
+            name: 'Last-10 average',
+            value: formatDurationSeconds(
+              alertRow.average_on_duration_seconds
+            ),
+            inline: true,
+          },
+          {
+            name: 'Standard deviation',
+            value: formatDurationSeconds(
+              alertRow.standard_deviation_seconds
+            ),
+            inline: true,
+          },
+          {
+            name: 'Alert threshold',
+            value: formatDurationSeconds(
+              alertRow.threshold_duration_seconds
+            ),
+            inline: true,
+          },
+        ],
+
+        footer: {
+          text: `Based on the last ${alertRow.sample_size} completed ON cycles`,
+        },
+
+        timestamp: alertRow.triggered_at,
+      },
+    ],
+  });
+}
+
+async function evaluateAndSendLongOnAlert(deviceId) {
+  const { data: evaluationRows, error: evaluationError } =
+    await supabase.rpc('evaluate_long_on_alert', {
+      p_device_id: deviceId,
+    });
+
+  if (evaluationError) {
+    throw evaluationError;
+  }
+
+  const evaluation = evaluationRows?.[0] ?? null;
+
+  if (!evaluation?.alert_created || !evaluation.alert_id) {
+    return {
+      evaluation,
+      notificationAttempted: false,
+      notificationSent: false,
+    };
+  }
+
+  const { data: alertRows, error: alertError } = await supabase
+    .from('device_alerts')
+    .select(
+      'id, device_id, cycle_started_at, triggered_at, current_duration_seconds, average_on_duration_seconds, standard_deviation_seconds, threshold_duration_seconds, sample_size, notification_attempts'
+    )
+    .eq('id', evaluation.alert_id)
+    .limit(1);
+
+  if (alertError) {
+    throw alertError;
+  }
+
+  const alertRow = alertRows?.[0] ?? null;
+
+  if (!alertRow) {
+    throw new Error(
+      `Long ON alert ${evaluation.alert_id} was created but could not be loaded.`
+    );
+  }
+
+  try {
+    const discordResult = await sendLongOnDiscordAlert(alertRow);
+
+    try {
+      await updateAlertNotificationStatus(alertRow, 'SENT');
+    } catch (statusError) {
+      console.error(
+        'Discord sent, but SENT status could not be saved:',
+        statusError
+      );
+    }
+
+    return {
+      evaluation,
+      notificationAttempted: true,
+      notificationSent: true,
+      discordMessageId: discordResult.body?.id ?? null,
+    };
+  } catch (error) {
+    console.error(`Discord alert failed for ${deviceId}:`, error);
+
+    try {
+      await updateAlertNotificationStatus(
+        alertRow,
+        'FAILED',
+        error?.message ?? error
+      );
+    } catch (statusError) {
+      console.error(
+        'Could not record Discord notification failure:',
+        statusError
+      );
+    }
+
+    return {
+      evaluation,
+      notificationAttempted: true,
+      notificationSent: false,
+      error: String(error?.message ?? error),
+    };
+  }
+}
+
 app.get('/', (req, res) => {
   res.send('Backend is running 🚀');
 });
 
 app.get('/devices', (req, res) => {
   res.json(KNOWN_DEVICES);
+});
+
+app.post('/alerts/test', async (req, res) => {
+  const providedToken = String(
+    req.get('x-alert-test-token') || ''
+  );
+
+  if (
+    !discordAlertTestToken ||
+    providedToken !== discordAlertTestToken
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized.',
+    });
+  }
+
+  try {
+    const discordResult = await postDiscordWebhook({
+      username: 'Pump Monitor',
+
+      content: '✅ Pump Monitor Discord test succeeded.',
+
+      allowed_mentions: {
+        parse: [],
+      },
+
+      embeds: [
+        {
+          title: 'Discord Alert Test',
+
+          description:
+            'The sensor backend can successfully send pump alerts to this channel.',
+
+          color: 0x16a34a,
+
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+
+    return res.json({
+      success: true,
+      message: 'Discord test alert sent.',
+      discordMessageId: discordResult.body?.id ?? null,
+    });
+  } catch (error) {
+    console.error('Discord test alert failed:', error);
+
+    return res.status(502).json({
+      success: false,
+      message: 'Discord test alert failed.',
+      error: String(error?.message ?? error),
+    });
+  }
 });
 
 app.get('/signal', async (req, res) => {
@@ -585,11 +933,25 @@ app.post('/signal', async (req, res) => {
 
     await saveDeviceStateRow(stateRow, existedAlready);
 
+    let longOnAlertResult = null;
+
+    try {
+      longOnAlertResult = await evaluateAndSendLongOnAlert(
+        requestDeviceId
+      );
+    } catch (alertError) {
+      console.error(
+        `Long ON alert evaluation failed for ${requestDeviceId}:`,
+        alertError
+      );
+    }
+
     res.json({
       success: true,
       receivedCount: normalizedPoints.length,
       latest: normalizedPoints[normalizedPoints.length - 1],
       storedCount: null,
+      longOnAlert: longOnAlertResult,
     });
   } catch (error) {
     console.error(error);
