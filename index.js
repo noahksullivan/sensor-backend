@@ -18,16 +18,30 @@ const DEFAULT_PAGE_SIZE = 200;
 const MAX_PAGE_SIZE = 500;
 const DEFAULT_TRANSITION_LIMIT = 20;
 const MAX_TRANSITION_LIMIT = 100;
+
+const DEFAULT_PRESSURE_LIMIT = 600;
+const MAX_PRESSURE_LIMIT = 2000;
+
 const ON_THRESHOLD_AMPS = 0.5;
 
 const KNOWN_DEVICES = [
   {
     deviceId: 'esp32-001',
     label: 'Hilltop',
+    type: 'current',
+    unit: 'A',
   },
   {
     deviceId: 'esp32-002',
     label: 'Site 3',
+    type: 'current',
+    unit: 'A',
+  },
+  {
+    deviceId: 'esp32-003',
+    label: 'Pressure Sensor',
+    type: 'pressure',
+    unit: 'kPa',
   },
 ];
 
@@ -116,6 +130,31 @@ function toPublicSignalPoint(row) {
     triggered: row.triggered,
     value: Number(row.value),
     timestamp: row.timestamp,
+  };
+}
+
+function toPublicPressurePoint(row) {
+  return {
+    deviceId: row.device_id,
+    value: Number(row.pressure_kpa),
+    unit: 'kPa',
+    timestamp: row.window_ended_at,
+
+    sampleCount: Number(row.sample_count ?? 0),
+
+    sensorOutputVolts:
+      row.sensor_output_volts === null ||
+      row.sensor_output_volts === undefined
+        ? null
+        : Number(row.sensor_output_volts),
+
+    adcMillivolts:
+      row.adc_millivolts === null ||
+      row.adc_millivolts === undefined
+        ? null
+        : Number(row.adc_millivolts),
+
+    windowStartedAt: row.window_started_at ?? null,
   };
 }
 
@@ -553,6 +592,300 @@ app.post('/alerts/test', async (req, res) => {
   }
 });
 
+app.post('/pressure', async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const deviceId =
+      typeof body.deviceId === 'string'
+        ? body.deviceId.trim()
+        : '';
+
+    const pressureDevice = KNOWN_DEVICES.find(
+      (device) =>
+        device.deviceId === deviceId &&
+        device.type === 'pressure'
+    );
+
+    if (!pressureDevice) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid pressure deviceId is required.',
+      });
+    }
+
+    const pressureKpa = Number(body.pressureKpa);
+    const sampleCount = Number(body.sampleCount);
+
+    const sensorOutputVolts =
+      body.sensorOutputVolts === null ||
+      body.sensorOutputVolts === undefined
+        ? null
+        : Number(body.sensorOutputVolts);
+
+    const adcMillivolts =
+      body.adcMillivolts === null ||
+      body.adcMillivolts === undefined
+        ? null
+        : Number(body.adcMillivolts);
+
+    if (!Number.isFinite(pressureKpa)) {
+      return res.status(400).json({
+        success: false,
+        message: 'pressureKpa must be numeric.',
+      });
+    }
+
+    if (
+      !Number.isInteger(sampleCount) ||
+      sampleCount <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'sampleCount must be a positive integer.',
+      });
+    }
+
+    if (
+      body.windowStartedAt === undefined ||
+      body.windowEndedAt === undefined
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'windowStartedAt and windowEndedAt are required.',
+      });
+    }
+
+    const windowStartedAt = normalizeTimestamp(
+      body.windowStartedAt
+    );
+
+    const windowEndedAt = normalizeTimestamp(
+      body.windowEndedAt
+    );
+
+    if (
+      new Date(windowEndedAt).getTime() <=
+      new Date(windowStartedAt).getTime()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'windowEndedAt must be later than windowStartedAt.',
+      });
+    }
+
+    const row = {
+      device_id: deviceId,
+      pressure_kpa: pressureKpa,
+
+      sensor_output_volts:
+        Number.isFinite(sensorOutputVolts)
+          ? sensorOutputVolts
+          : null,
+
+      adc_millivolts:
+        Number.isFinite(adcMillivolts)
+          ? Math.round(adcMillivolts)
+          : null,
+
+      sample_count: sampleCount,
+      window_started_at: windowStartedAt,
+      window_ended_at: windowEndedAt,
+    };
+
+    /*
+      Upsert makes ESP retries safe. If the same completed
+      10-second window is uploaded twice, it updates the
+      existing row instead of creating a duplicate error.
+    */
+    const { data, error } = await supabase
+      .from('pressure_points')
+      .upsert(row, {
+        onConflict: 'device_id,window_ended_at',
+      })
+      .select(
+        `
+          device_id,
+          pressure_kpa,
+          sensor_output_volts,
+          adc_millivolts,
+          sample_count,
+          window_started_at,
+          window_ended_at
+        `
+      )
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return res.status(201).json({
+      success: true,
+      reading: toPublicPressurePoint(data),
+    });
+  } catch (error) {
+    console.error(
+      'Could not store pressure reading:',
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not store pressure reading.',
+    });
+  }
+});
+
+app.get('/pressure', async (req, res) => {
+  try {
+    const { deviceId, since } = req.query;
+
+    const pressureDevice = KNOWN_DEVICES.find(
+      (device) =>
+        device.deviceId === deviceId &&
+        device.type === 'pressure'
+    );
+
+    if (!pressureDevice) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid pressure deviceId is required.',
+      });
+    }
+
+    const limit = sanitizePositiveInt(
+      req.query.limit,
+      DEFAULT_PRESSURE_LIMIT,
+      MAX_PRESSURE_LIMIT
+    );
+
+    let query = supabase
+      .from('pressure_points')
+      .select(
+        `
+          device_id,
+          pressure_kpa,
+          sensor_output_volts,
+          adc_millivolts,
+          sample_count,
+          window_started_at,
+          window_ended_at
+        `
+      )
+      .eq('device_id', deviceId)
+      .order('window_ended_at', {
+        ascending: false,
+      })
+      .limit(limit);
+
+    if (since) {
+      query = query.gt('window_ended_at', since);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    const readings = (data ?? [])
+      .slice()
+      .reverse()
+      .map(toPublicPressurePoint);
+
+    return res.json(readings);
+  } catch (error) {
+    console.error(
+      'Could not load pressure readings:',
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not load pressure readings.',
+    });
+  }
+});
+
+app.get('/pressure/summary', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+
+    const pressureDevice = KNOWN_DEVICES.find(
+      (device) =>
+        device.deviceId === deviceId &&
+        device.type === 'pressure'
+    );
+
+    if (!pressureDevice) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid pressure deviceId is required.',
+      });
+    }
+
+    const bucketCount = sanitizePositiveInt(
+      req.query.bucketCount,
+      DEFAULT_HISTORY_BUCKET_COUNT,
+      MAX_HISTORY_BUCKET_COUNT
+    );
+
+    const [
+      { count, error: countError },
+      { data, error: summaryError },
+    ] = await Promise.all([
+      supabase
+        .from('pressure_points')
+        .select('*', {
+          count: 'exact',
+          head: true,
+        })
+        .eq('device_id', deviceId),
+
+      supabase.rpc('get_pressure_summary', {
+        p_device_id: deviceId,
+        p_bucket_count: bucketCount,
+      }),
+    ]);
+
+    if (countError) {
+      throw countError;
+    }
+
+    if (summaryError) {
+      throw summaryError;
+    }
+
+    const points = (data ?? []).map(
+      toPublicPressurePoint
+    );
+
+    return res.json({
+      deviceId,
+      totalPoints: count ?? 0,
+      bucketCount,
+      oldestTimestamp:
+        points[0]?.timestamp ?? null,
+      latestTimestamp:
+        points[points.length - 1]?.timestamp ?? null,
+      points,
+    });
+  } catch (error) {
+    console.error(
+      'Could not load pressure summary:',
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not load pressure summary.',
+    });
+  }
+});
+
 app.get('/signal', async (req, res) => {
   try {
     const { deviceId } = req.query;
@@ -565,9 +898,15 @@ app.get('/signal', async (req, res) => {
     }
 
     const latestRow = await getLatestSignalRow(deviceId);
-    res.json(latestRow ? toPublicSignalPoint(latestRow) : null);
+
+    res.json(
+      latestRow
+        ? toPublicSignalPoint(latestRow)
+        : null
+    );
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
       message: 'Could not load latest signal.',
@@ -623,31 +962,44 @@ app.get('/dashboard', async (req, res) => {
 
     res.json({
       deviceId,
-      thresholdAmps: Number(stateRow.threshold_amps ?? ON_THRESHOLD_AMPS),
+      thresholdAmps: Number(
+        stateRow.threshold_amps ?? ON_THRESHOLD_AMPS
+      ),
       latestSignal: stateRow.latest_signal_at
         ? {
             deviceId,
-            triggered: Boolean(stateRow.latest_signal_triggered),
-            value: Number(stateRow.latest_signal_value ?? 0),
+            triggered: Boolean(
+              stateRow.latest_signal_triggered
+            ),
+            value: Number(
+              stateRow.latest_signal_value ?? 0
+            ),
             timestamp: stateRow.latest_signal_at,
           }
         : null,
-      currentState: stateRow.current_state ?? null,
-      currentStateStartedAt: stateRow.current_state_started_at ?? null,
+      currentState:
+        stateRow.current_state ?? null,
+      currentStateStartedAt:
+        stateRow.current_state_started_at ?? null,
       currentStateDurationSeconds,
       lastCompletedOnDurationSeconds:
-        stateRow.last_completed_on_duration_seconds ?? null,
+        stateRow.last_completed_on_duration_seconds ??
+        null,
       lastCompletedOffDurationSeconds:
-        stateRow.last_completed_off_duration_seconds ?? null,
-      recentTransitions: recentTransitions.map((row) => ({
-        state: row.state,
-        startedAt: row.started_at,
-        endedAt: row.ended_at,
-        durationSeconds: row.duration_seconds,
-      })),
+        stateRow.last_completed_off_duration_seconds ??
+        null,
+      recentTransitions: recentTransitions.map(
+        (row) => ({
+          state: row.state,
+          startedAt: row.started_at,
+          endedAt: row.ended_at,
+          durationSeconds: row.duration_seconds,
+        })
+      ),
     });
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
       message: 'Could not load dashboard data.',
@@ -669,16 +1021,22 @@ app.get('/signals', async (req, res) => {
     if (since) {
       const { data, error } = await supabase
         .from('signal_points')
-        .select('device_id, triggered, value, timestamp')
+        .select(
+          'device_id, triggered, value, timestamp'
+        )
         .eq('device_id', deviceId)
         .gt('timestamp', since)
-        .order('timestamp', { ascending: true });
+        .order('timestamp', {
+          ascending: true,
+        });
 
       if (error) {
         throw error;
       }
 
-      return res.json((data ?? []).map(toPublicSignalPoint));
+      return res.json(
+        (data ?? []).map(toPublicSignalPoint)
+      );
     }
 
     const limit = sanitizePositiveInt(
@@ -689,18 +1047,28 @@ app.get('/signals', async (req, res) => {
 
     const { data, error } = await supabase
       .from('signal_points')
-      .select('device_id, triggered, value, timestamp')
+      .select(
+        'device_id, triggered, value, timestamp'
+      )
       .eq('device_id', deviceId)
-      .order('timestamp', { ascending: false })
+      .order('timestamp', {
+        ascending: false,
+      })
       .limit(limit);
 
     if (error) {
       throw error;
     }
 
-    return res.json((data ?? []).slice().reverse().map(toPublicSignalPoint));
+    return res.json(
+      (data ?? [])
+        .slice()
+        .reverse()
+        .map(toPublicSignalPoint)
+    );
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
       message: 'Could not load signal history.',
@@ -725,17 +1093,23 @@ app.get('/signals/summary', async (req, res) => {
       MAX_HISTORY_BUCKET_COUNT
     );
 
-    const [{ count, error: countError }, { data, error: rpcError }] =
-      await Promise.all([
-        supabase
-          .from('signal_points')
-          .select('*', { count: 'exact', head: true })
-          .eq('device_id', deviceId),
-        supabase.rpc('get_signal_summary', {
-          p_device_id: deviceId,
-          p_bucket_count: bucketCount,
-        }),
-      ]);
+    const [
+      { count, error: countError },
+      { data, error: rpcError },
+    ] = await Promise.all([
+      supabase
+        .from('signal_points')
+        .select('*', {
+          count: 'exact',
+          head: true,
+        })
+        .eq('device_id', deviceId),
+
+      supabase.rpc('get_signal_summary', {
+        p_device_id: deviceId,
+        p_bucket_count: bucketCount,
+      }),
+    ]);
 
     if (countError) {
       throw countError;
@@ -745,18 +1119,23 @@ app.get('/signals/summary', async (req, res) => {
       throw rpcError;
     }
 
-    const points = (data ?? []).map(toPublicSignalPoint);
+    const points = (data ?? []).map(
+      toPublicSignalPoint
+    );
 
     res.json({
       deviceId,
       totalPoints: count ?? 0,
       bucketCount,
-      oldestTimestamp: points[0]?.timestamp ?? null,
-      latestTimestamp: points[points.length - 1]?.timestamp ?? null,
+      oldestTimestamp:
+        points[0]?.timestamp ?? null,
+      latestTimestamp:
+        points[points.length - 1]?.timestamp ?? null,
       points,
     });
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
       message: 'Could not load signal summary.',
@@ -783,9 +1162,13 @@ app.get('/signals/page', async (req, res) => {
 
     let query = supabase
       .from('signal_points')
-      .select('device_id, triggered, value, timestamp')
+      .select(
+        'device_id, triggered, value, timestamp'
+      )
       .eq('device_id', deviceId)
-      .order('timestamp', { ascending: false })
+      .order('timestamp', {
+        ascending: false,
+      })
       .limit(pageSize + 1);
 
     if (before) {
@@ -800,10 +1183,14 @@ app.get('/signals/page', async (req, res) => {
 
     const rows = data ?? [];
     const hasMore = rows.length > pageSize;
-    const visibleRows = hasMore ? rows.slice(0, pageSize) : rows;
+    const visibleRows = hasMore
+      ? rows.slice(0, pageSize)
+      : rows;
+
     const nextBefore =
       visibleRows.length > 0
-        ? visibleRows[visibleRows.length - 1].timestamp
+        ? visibleRows[visibleRows.length - 1]
+            .timestamp
         : null;
 
     res.json({
@@ -811,13 +1198,17 @@ app.get('/signals/page', async (req, res) => {
       totalPoints: null,
       hasMore,
       nextBefore,
-      readings: visibleRows.map(toPublicSignalPoint),
+      readings: visibleRows.map(
+        toPublicSignalPoint
+      ),
     });
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
-      message: 'Could not load paged signal history.',
+      message:
+        'Could not load paged signal history.',
     });
   }
 });
@@ -827,11 +1218,14 @@ app.post('/signal', async (req, res) => {
     const body = req.body || {};
 
     const requestDeviceId =
-      typeof body.deviceId === 'string' && body.deviceId.trim()
+      typeof body.deviceId === 'string' &&
+      body.deviceId.trim()
         ? body.deviceId.trim()
         : DEFAULT_DEVICE_ID;
 
-    const rawPoints = Array.isArray(body.points) ? body.points : [body];
+    const rawPoints = Array.isArray(body.points)
+      ? body.points
+      : [body];
 
     if (rawPoints.length === 0) {
       return res.status(400).json({
@@ -846,7 +1240,9 @@ app.post('/signal', async (req, res) => {
           {
             ...point,
             deviceId:
-              typeof point?.deviceId === 'string' && point.deviceId.trim()
+              typeof point?.deviceId ===
+                'string' &&
+              point.deviceId.trim()
                 ? point.deviceId.trim()
                 : requestDeviceId,
           },
@@ -855,17 +1251,23 @@ app.post('/signal', async (req, res) => {
       )
     );
 
-    const dbPoints = normalizedPoints.map(toDbSignalPoint);
+    const dbPoints = normalizedPoints.map(
+      toDbSignalPoint
+    );
 
-    const { error: insertSignalError } = await supabase
-      .from('signal_points')
-      .insert(dbPoints);
+    const { error: insertSignalError } =
+      await supabase
+        .from('signal_points')
+        .insert(dbPoints);
 
     if (insertSignalError) {
       throw insertSignalError;
     }
 
-    let stateRow = await getDeviceStateRow(requestDeviceId);
+    let stateRow = await getDeviceStateRow(
+      requestDeviceId
+    );
+
     const existedAlready = Boolean(stateRow);
 
     if (!stateRow) {
@@ -877,8 +1279,10 @@ app.post('/signal', async (req, res) => {
         latest_signal_value: null,
         latest_signal_triggered: false,
         threshold_amps: ON_THRESHOLD_AMPS,
-        last_completed_on_duration_seconds: null,
-        last_completed_off_duration_seconds: null,
+        last_completed_on_duration_seconds:
+          null,
+        last_completed_off_duration_seconds:
+          null,
         updated_at: new Date().toISOString(),
       };
     }
@@ -886,43 +1290,61 @@ app.post('/signal', async (req, res) => {
     const transitionRows = [];
 
     for (const point of normalizedPoints) {
-      const pointState = getPointState(point.value);
+      const pointState = getPointState(
+        point.value
+      );
 
       if (!stateRow.current_state) {
         stateRow.current_state = pointState;
-        stateRow.current_state_started_at = point.timestamp;
-      } else if (pointState !== stateRow.current_state) {
-        const durationSeconds = getDurationSeconds(
-          stateRow.current_state_started_at,
-          point.timestamp
-        );
+        stateRow.current_state_started_at =
+          point.timestamp;
+      } else if (
+        pointState !== stateRow.current_state
+      ) {
+        const durationSeconds =
+          getDurationSeconds(
+            stateRow.current_state_started_at,
+            point.timestamp
+          );
 
         transitionRows.push({
           device_id: requestDeviceId,
           state: stateRow.current_state,
-          started_at: stateRow.current_state_started_at,
+          started_at:
+            stateRow.current_state_started_at,
           ended_at: point.timestamp,
           duration_seconds: durationSeconds,
         });
 
-        if (stateRow.current_state === 'ON') {
-          stateRow.last_completed_on_duration_seconds = durationSeconds;
+        if (
+          stateRow.current_state === 'ON'
+        ) {
+          stateRow.last_completed_on_duration_seconds =
+            durationSeconds;
         } else {
-          stateRow.last_completed_off_duration_seconds = durationSeconds;
+          stateRow.last_completed_off_duration_seconds =
+            durationSeconds;
         }
 
         stateRow.current_state = pointState;
-        stateRow.current_state_started_at = point.timestamp;
+        stateRow.current_state_started_at =
+          point.timestamp;
       }
 
-      stateRow.latest_signal_at = point.timestamp;
-      stateRow.latest_signal_value = point.value;
-      stateRow.latest_signal_triggered = point.triggered;
-      stateRow.updated_at = new Date().toISOString();
+      stateRow.latest_signal_at =
+        point.timestamp;
+      stateRow.latest_signal_value =
+        point.value;
+      stateRow.latest_signal_triggered =
+        point.triggered;
+      stateRow.updated_at =
+        new Date().toISOString();
     }
 
     if (transitionRows.length > 0) {
-      const { error: insertTransitionError } = await supabase
+      const {
+        error: insertTransitionError,
+      } = await supabase
         .from('state_transitions')
         .insert(transitionRows);
 
@@ -931,14 +1353,18 @@ app.post('/signal', async (req, res) => {
       }
     }
 
-    await saveDeviceStateRow(stateRow, existedAlready);
+    await saveDeviceStateRow(
+      stateRow,
+      existedAlready
+    );
 
     let longOnAlertResult = null;
 
     try {
-      longOnAlertResult = await evaluateAndSendLongOnAlert(
-        requestDeviceId
-      );
+      longOnAlertResult =
+        await evaluateAndSendLongOnAlert(
+          requestDeviceId
+        );
     } catch (alertError) {
       console.error(
         `Long ON alert evaluation failed for ${requestDeviceId}:`,
@@ -948,16 +1374,22 @@ app.post('/signal', async (req, res) => {
 
     res.json({
       success: true,
-      receivedCount: normalizedPoints.length,
-      latest: normalizedPoints[normalizedPoints.length - 1],
+      receivedCount:
+        normalizedPoints.length,
+      latest:
+        normalizedPoints[
+          normalizedPoints.length - 1
+        ],
       storedCount: null,
       longOnAlert: longOnAlertResult,
     });
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       success: false,
-      message: 'Could not store signal points.',
+      message:
+        'Could not store signal points.',
     });
   }
 });
