@@ -22,6 +22,15 @@ const MAX_TRANSITION_LIMIT = 100;
 const DEFAULT_PRESSURE_LIMIT = 600;
 const MAX_PRESSURE_LIMIT = 2000;
 
+// Pressure data shown directly on the front dashboard.
+const DEFAULT_PRESSURE_DASHBOARD_DAYS = 7;
+const MAX_PRESSURE_DASHBOARD_DAYS = 31;
+
+// One displayed point represents the highest pressure
+// reading inside this many minutes.
+const DEFAULT_PRESSURE_DASHBOARD_BUCKET_MINUTES = 15;
+const MAX_PRESSURE_DASHBOARD_BUCKET_MINUTES = 1440;
+
 const ON_THRESHOLD_AMPS = 0.5;
 
 const KNOWN_DEVICES = [
@@ -806,6 +815,132 @@ app.get('/pressure', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Could not load pressure readings.',
+    });
+  }
+});
+
+app.get('/pressure/dashboard', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+
+    const pressureDevice = KNOWN_DEVICES.find(
+      (device) =>
+        device.deviceId === deviceId &&
+        device.type === 'pressure'
+    );
+
+    if (!pressureDevice) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid pressure deviceId is required.',
+      });
+    }
+
+    const days = sanitizePositiveInt(
+      req.query.days,
+      DEFAULT_PRESSURE_DASHBOARD_DAYS,
+      MAX_PRESSURE_DASHBOARD_DAYS
+    );
+
+    const bucketMinutes = sanitizePositiveInt(
+      req.query.bucketMinutes,
+      DEFAULT_PRESSURE_DASHBOARD_BUCKET_MINUTES,
+      MAX_PRESSURE_DASHBOARD_BUCKET_MINUTES
+    );
+
+    const rangeEndedAt = new Date();
+
+    const rangeStartedAt = new Date(
+      rangeEndedAt.getTime() -
+        days * 24 * 60 * 60 * 1000
+    );
+
+    const pressureColumns = `
+      device_id,
+      pressure_kpa,
+      sensor_output_volts,
+      adc_millivolts,
+      sample_count,
+      window_started_at,
+      window_ended_at
+    `;
+
+    const [
+      {
+        data: summaryRows,
+        error: summaryError,
+      },
+      {
+        data: latestRows,
+        error: latestError,
+      },
+    ] = await Promise.all([
+      supabase.rpc(
+        'get_pressure_range_summary',
+        {
+          p_device_id: deviceId,
+          p_start_time:
+            rangeStartedAt.toISOString(),
+          p_end_time:
+            rangeEndedAt.toISOString(),
+          p_bucket_minutes: bucketMinutes,
+        }
+      ),
+
+      supabase
+        .from('pressure_points')
+        .select(pressureColumns)
+        .eq('device_id', deviceId)
+        .order('window_ended_at', {
+          ascending: false,
+        })
+        .limit(1),
+    ]);
+
+    if (summaryError) {
+      throw summaryError;
+    }
+
+    if (latestError) {
+      throw latestError;
+    }
+
+    const readings = (summaryRows ?? [])
+      .map(toPublicPressurePoint)
+      .sort(
+        (a, b) =>
+          new Date(a.timestamp).getTime() -
+          new Date(b.timestamp).getTime()
+      );
+
+    const latestReading =
+      latestRows?.[0]
+        ? toPublicPressurePoint(
+            latestRows[0]
+          )
+        : null;
+
+    return res.json({
+      deviceId,
+      days,
+      bucketMinutes,
+      rangeStartedAt:
+        rangeStartedAt.toISOString(),
+      rangeEndedAt:
+        rangeEndedAt.toISOString(),
+      readings,
+      latestReading,
+    });
+  } catch (error) {
+    console.error(
+      'Could not load pressure dashboard:',
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        'Could not load pressure dashboard.',
     });
   }
 });
